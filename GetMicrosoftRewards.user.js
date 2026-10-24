@@ -529,8 +529,8 @@
         };
         const level = number(/\\"balance\\":\\?([0-9]+),\\"level\\":\\?([0-9]+)/, 1, 2);
         const points = number(/\\"balance\\":\\?([0-9]+)/, 0);
-        const searchCur = number(/\\"activitiesCompleted\\":\\?([0-9]+),\\"activitiesLabel\\":\\?\\"Search_ProgressLabel\\"/, 0);
-        const searchMax = number(/\\"activitiesLabel\\":\\?\\"Search_ProgressLabel\\",\\"activitiesTotal\\":\\?([0-9]+)/, 0);
+        const searchCur = number(/\\"progress\\":([0-9]+),\\"originalMax\\"/, 0);
+        const searchMax = number(/\\"pc\\":\{\\"max\\":([0-9]+)/, 0);
         const completed = (html.match(/\\"isCompleted\\":\\?true/g) || []).length;
         const total = (html.match(/\\"offerId\\":/g) || []).length;
         return { level, points, searchCur, searchMax, promosDone: completed, promosTotal: total };
@@ -543,7 +543,7 @@
         state.updatingPromise = (async () => {
             try {
                 const res = await gmRequest({
-                    url: `https://rewards.bing.com/dashboard?_=${Date.now()}`,
+                    url: `https://rewards.bing.com/earn?_=${Date.now()}`,
                     headers: { 'Accept': 'text/html,application/xhtml+xml', 'Referer': 'https://rewards.bing.com/' },
                     anonymous: false
                 });
@@ -562,7 +562,7 @@
                 dashboard = { dailySetPromotions: {}, morePromotions: [] };
                 state.level = data.level || 1;
                 state.points = data.points;
-                let pc = data.searchCur * 3, pcM = data.searchMax * 3, mob = 0, mobM = 0;
+                let pc = data.searchCur, pcM = data.searchMax, mob = 0, mobM = 0;
 
                 // 如果移动搜索上限为0且等级>1，尝试推断 (Lv2通常是60分)
                 if (mobM === 0 && state.level > 1) {
@@ -700,6 +700,7 @@
                 headers: { 'Authorization': `Bearer ${token}`, 'X-Rewards-AppId': 'SAAndroid/31.4.2110003555', 'X-Rewards-IsMobile': 'true' }
             }));
             if (info) {
+                const readPoints = 3;
                 const d = JSON.parse(info);
                 const p = d.response?.promotions?.find(x => x.attributes?.offerid === 'ENUS_readarticle3_30points');
                 if (p) {
@@ -708,9 +709,9 @@
 
                     if (cur >= max) { log('✅ 阅读任务已完成'); }
                     else {
-                        for (let i = cur; i < max; i++) {
+                        for (let i = cur / readPoints; i < max / readPoints; i++) {
                             await waitWhilePaused();
-                            log(`📖 阅读文章 ${i + 1}/${max}`);
+                            log(`📖 阅读文章 ${i + 1}/${max / readPoints}`);
                             await withAccessTokenRequest(token => gmRequest({
                                 method: 'POST',
                                 url: 'https://prod.rewardsplatform.microsoft.com/dapi/me/activities',
@@ -722,8 +723,8 @@
                                     amount: 1, country: 'cn', id: uuid(), type: 101, attributes: { offerid: 'ENUS_readarticle3_30points' }
                                 })
                             }));
-                            await sleep(2500);
-                            state.readCur++; render();
+                            await sleep(25000);
+                            state.readCur += readPoints; render();
                         }
                         log('✅ 阅读完成');
                     }
