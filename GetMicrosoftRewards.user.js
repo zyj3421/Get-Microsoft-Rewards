@@ -36,8 +36,11 @@
 
     // ========== 配置 ==========
     const CONFIG = {
-        pc: { minDelay: 15000, maxDelay: 30000 },
+        pc: { minDelay: 30000, maxDelay: 60000 },
         mobile: { minDelay: 20000, maxDelay: 35000 },
+        retry: {
+            maxCount: 5 // 以防最后一次出现意外，尝试继续搜索补刀次数的上限
+        },
         ua: {
             pc: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.2420.81',
             mobile: 'Mozilla/5.0 (Linux; Android 16; MCE16 Build/BP3A.250905.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36 EdgA/123.0.2420.102'
@@ -48,12 +51,20 @@
             { url: 'https://hotapi.nntool.cc/', sources: ['weibo', 'douyin', 'baidu', 'toutiao', 'zhihu'] },
             { url: 'https://cnxiaobai.com/DailyHotApi/', sources: ['weibo', 'douyin', 'baidu', 'toutiao'] }
         ],
-        keywords: ["天气预报", "今日新闻", "体育赛事", "股票行情", "电影推荐", "科技资讯", "美食食谱", "旅游攻略"],
+        // 本地词库
+        keywords: [
+            "天气预报", "今日热点", "股票行情", "体育赛事",
+            "电影推荐", "科技资讯", "美食菜谱", "旅游攻略",
+            "数码评测", "游戏排行", "汽车报价", "健康养生",
+            "国际新闻", "财经资讯", "手机测评", "本地生活"
+        ],
+        // 通用后缀库，与本地词库组合扩充本地词库
+        suffixes: ['最新', '排名', '怎么样', '查询', '今天', '实时', '大全', new Date().getFullYear().toString(), '行情', '评测', '价格', '直播', '附近'],
         // 暂停机制配置
         pause: {
             enabled: true,           // 是否启用暂停机制
-            interval: 10,            // 每执行多少次搜索后暂停
-            duration: 15 * 60 * 1000 // 暂停时长（毫秒），15分钟
+            interval: 2,            // 每执行多少次搜索后暂停
+            duration: 5 * 60 * 1000 // 暂停时长（毫秒），5分钟
         }
     };
 
@@ -61,7 +72,6 @@
     let state = {
         level: 1, points: 0,
         pcCur: 0, pcMax: 0,
-        mobileCur: 0, mobileMax: 0,
         promosTotal: 0, promosDone: 0,
         signDone: false, signPoints: -1,
         readCur: 0, readMax: 0,
@@ -82,6 +92,7 @@
     };
     let dashboard = null;
     let loginCookie = '';
+    let queryPool = [];
 
     // ========== 进度保存/恢复 ==========
     const STORAGE_KEY = 'mr_search_progress';
@@ -90,7 +101,8 @@
         const today = getDateHyphen();
         const data = {
             date: today,
-            searchCount: state.searchCount
+            searchCount: state.searchCount,
+            queryPool: queryPool
         };
         GM_setValue(STORAGE_KEY, JSON.stringify(data));
     }
@@ -103,6 +115,7 @@
             // 只恢复当天的进度
             if (data.date === getDateHyphen()) {
                 state.searchCount = data.searchCount || 0;
+                queryPool = data.queryPool || [];
                 return data;
             }
         } catch (e) { }
@@ -200,7 +213,18 @@
 
     // 获取热搜词（支持多源自动切换）
     async function getHotQuery() {
-        // 打乱API顺序，随机选择
+        // 如果本地池子还有词，直接弹出
+        if (queryPool.length > 0) {
+            const q = queryPool.shift();
+            saveProgress();
+            return q;
+        }
+
+        let allTitles = new Set();
+
+        // 目标池子大小 = 今日搜索次数 + 补刀次数
+        const targetPoolSize = Math.ceil(state.pcMax / 3) + CONFIG.retry.maxCount;
+        // 池子空了，尝试去 API 拉取，打乱API顺序，随机选择
         const apis = [...CONFIG.hotApis].sort(() => Math.random() - 0.5);
 
         for (const api of apis) {
@@ -209,15 +233,48 @@
                 const res = await gmRequest({ method: 'GET', url: api.url + src, timeout: 8000 });
                 const data = JSON.parse(res);
                 if (data.code === 200 && data.data?.length) {
-                    const title = randomPick(data.data).title || '';
-                    // 随机截取长度，更自然
-                    const len = randomRange(8, 25);
-                    return title.substring(0, len);
+                    data.data.forEach(item => {
+                        if (item.title) {
+                            // 随机截取长度，更自然
+                            allTitles.add(item.title.substring(0, randomRange(8, 25)).trim());
+                        }
+                    });
+                    if (allTitles.size >= targetPoolSize) break;
                 }
             } catch { /* 尝试下一个API */ }
         }
-        // 所有API都失败，使用本地关键词
-        return `${randomPick(CONFIG.keywords)} ${Math.random().toString(36).slice(2, 6)}`;
+
+        // 打乱 API 拿到的词
+        let titlesArray = [...allTitles].sort(() => Math.random() - 0.5);
+
+        // 所有API都失败或者所需词库不足，使用本地关键词+后缀随机扩充
+        if (titlesArray.length < targetPoolSize) {
+            const needCount = targetPoolSize - titlesArray.length;
+            log(`⚠️ 扩充本地词库，需补齐 ${needCount} 个词...`);
+
+            const baseKeywords = CONFIG.keywords;
+            const currentMonth = (new Date().getMonth() + 1).toString();
+
+            let localSet = new Set(titlesArray);
+
+            while (localSet.size < targetPoolSize) {
+                const base = randomPick(baseKeywords);
+                const rand = Math.random();
+                if (rand < 0.2) {
+                    localSet.add(base);
+                } else if (rand < 0.7) {
+                    localSet.add(`${base} ${randomPick(CONFIG.suffixes)}`);
+                } else {
+                    localSet.add(`${base} ${currentMonth}月`);
+                }
+            }
+            titlesArray = [...localSet].sort(() => Math.random() - 0.5);
+        }
+
+        queryPool = titlesArray;
+        saveProgress();
+        // 递归取出第一个词
+        return getHotQuery();
     }
 
     // Cookie 管理
@@ -364,9 +421,6 @@
                 <div class="mr-row"><span>💻 PC搜索</span><span id="mr-pc">0/0</span></div>
                 <div class="mr-progress-bg"><div class="mr-bar" id="mr-pc-bar"></div></div>
 
-                <div class="mr-row"><span>📱 移动搜索</span><span id="mr-mobile">0/0</span></div>
-                <div class="mr-progress-bg"><div class="mr-bar" id="mr-mobile-bar"></div></div>
-
                 <div class="mr-row"><span>📖 阅读任务</span><span id="mr-read">0/0</span></div>
                 <div class="mr-progress-bg"><div class="mr-bar" id="mr-read-bar" style="background:#ff8c00"></div></div>
 
@@ -403,8 +457,6 @@
         points: $('#mr-points'),
         pc: $('#mr-pc'),
         pcBar: $('#mr-pc-bar'),
-        mob: $('#mr-mobile'),
-        mobBar: $('#mr-mobile-bar'),
         read: $('#mr-read'),
         readBar: $('#mr-read-bar'),
         btnSearch: $('#btn-search'),
@@ -531,6 +583,7 @@
         const points = number(/\\"balance\\":\\?([0-9]+)/, 0);
         const searchCur = number(/\\"progress\\":([0-9]+),\\"originalMax\\"/, 0);
         const searchMax = number(/\\"pc\\":\{\\"max\\":([0-9]+)/, 0);
+
         const completed = (html.match(/\\"isCompleted\\":\\?true/g) || []).length;
         const total = (html.match(/\\"offerId\\":/g) || []).length;
         return { level, points, searchCur, searchMax, promosDone: completed, promosTotal: total };
@@ -562,20 +615,14 @@
                 dashboard = { dailySetPromotions: {}, morePromotions: [] };
                 state.level = data.level || 1;
                 state.points = data.points;
-                let pc = data.searchCur, pcM = data.searchMax, mob = 0, mobM = 0;
-
-                // 如果移动搜索上限为0且等级>1，尝试推断 (Lv2通常是60分)
-                if (mobM === 0 && state.level > 1) {
-                    mobM = 60; // 假设值
-                }
+                let pc = data.searchCur, pcM = data.searchMax;
 
                 // 如果PC搜索上限为0，尝试推断
                 if (pcM === 0) {
-                    pcM = state.level > 1 ? 150 : 90; // Lv2=150, Lv1=90
+                    pcM = state.level > 2 ? 60 : state.level == 2 ? 30 : 15; // Lv3=60, Lv2=30, lv1=15
                 }
 
                 state.pcCur = pc; state.pcMax = pcM;
-                state.mobileCur = mob; state.mobileMax = mobM;
 
                 state.promosTotal = data.promosTotal;
                 state.promosDone = data.promosDone;
@@ -594,14 +641,11 @@
     }
 
     function render() {
-        nodes.level.textContent = `Lv.${state.level}`;
+        nodes.level.textContent = state.level >= 3 ? '🥇金牌会员' : state.level === 2 ? '🥈银牌会员' : '🥉会员';
         nodes.points.textContent = state.points.toLocaleString();
 
         nodes.pc.textContent = `${state.pcCur}/${state.pcMax}`;
         nodes.pcBar.style.width = state.pcMax ? `${(state.pcCur / state.pcMax) * 100}%` : '0%';
-
-        nodes.mob.textContent = `${state.mobileCur}/${state.mobileMax}`;
-        nodes.mobBar.style.width = state.mobileMax ? `${(state.mobileCur / state.mobileMax) * 100}%` : '0%';
 
         nodes.read.textContent = `${state.readCur}/${state.readMax}`;
         nodes.readBar.style.width = state.readMax ? `${(state.readCur / state.readMax) * 100}%` : '0%';
@@ -910,6 +954,9 @@
             saveProgress(); // 保存进度
 
             if (state.searchCount % CONFIG.pause.interval === 0) {
+                if (state.pcCur >= state.pcMax) {
+                    return; // 满了直接退出
+                }
                 state.isPaused = true;
                 const pauseMinutes = CONFIG.pause.duration / 60000;
                 log(`⏸️ 已完成 ${state.searchCount} 次搜索，暂停 ${pauseMinutes} 分钟降低风险...`);
@@ -942,22 +989,23 @@
             }
         }
 
-        // Mobile Search
-        const mobNeed = Math.ceil((state.mobileMax - state.mobileCur) / 3);
-        if (mobNeed > 0 && state.running) {
-            log(`📱 移动搜索 ${mobNeed}次`);
-            for (let i = 0; i < mobNeed && state.running; i++) {
-                await waitWhilePaused();
-                const q = await getHotQuery();
-                await doSearch(q, true);
-                await checkPause(); // 暂停检查
-                if (!state.running) break;
-                await preciseWait(randomRange(CONFIG.mobile.minDelay, CONFIG.mobile.maxDelay));
-                if ((i + 1) % 3 === 0) await updateData();
-            }
+        await updateData();
+
+        // 补搜索，原写法里可能需要，也许是之前每次获取的搜索词有重复了
+        let safetyCounter = 0;
+        while (state.pcCur < state.pcMax && state.running && safetyCounter < CONFIG.retry.maxCount) {
+            safetyCounter++;
+            const diff = state.pcMax - state.pcCur;
+            log(`⚠️ 微软实际进度 ${state.pcCur}/${state.pcMax}，还差 ${diff} 分，启动补搜 ${safetyCounter}/${CONFIG.retry.maxCount} ...`);
+            const q = await getHotQuery();
+            await doSearch(q, false);
+            await preciseWait(randomRange(CONFIG.pc.minDelay, CONFIG.pc.maxDelay));
+            await updateData();
         }
 
-        await updateData();
+        if (safetyCounter >= CONFIG.retry.maxCount && state.pcCur < state.pcMax) {
+            log(`⚠️ 连续补搜 ${CONFIG.retry.maxCount} 次仍未满，可能遭遇风控吞分，今日放弃补搜。`);
+        }
         state.running = false;
         nodes.btnSearch.textContent = '🔍 搜索';
         updateAllButton();
