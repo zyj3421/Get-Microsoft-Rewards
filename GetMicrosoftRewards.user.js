@@ -7,7 +7,7 @@
 // @icon         https://rewards.bing.com/rewardscdn/images/rewards.png
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
-// @match        https://rewards.bing.com/*
+// @exclude      https://rewards.bing.com/?*
 // @match        https://login.live.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -994,11 +994,14 @@
         // 补搜索，原写法里可能需要，也许是之前每次获取的搜索词有重复了
         let safetyCounter = 0;
         while (state.pcCur < state.pcMax && state.running && safetyCounter < CONFIG.retry.maxCount) {
+            await waitWhilePaused();
             safetyCounter++;
             const diff = state.pcMax - state.pcCur;
             log(`⚠️ 微软实际进度 ${state.pcCur}/${state.pcMax}，还差 ${diff} 分，启动补搜 ${safetyCounter}/${CONFIG.retry.maxCount} ...`);
             const q = await getHotQuery();
             await doSearch(q, false);
+            await checkPause(); // 暂停检查
+            if (!state.running) break;
             await preciseWait(randomRange(CONFIG.pc.minDelay, CONFIG.pc.maxDelay));
             await updateData();
         }
