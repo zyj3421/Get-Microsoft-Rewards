@@ -76,6 +76,8 @@
         signDone: false, signPoints: -1,
         readCur: 0, readMax: 0,
         running: false,
+        busyCount: 0,
+        allRunning: false,
         accessToken: null,
         accessTokenExpiresAt: 0,
         updating: false,
@@ -301,6 +303,33 @@
             if (typeof GM_cookie !== 'undefined') {
                 GM_cookie('delete', { url: `https://${host}`, name }, resolve);
             } else resolve();
+        });
+    }
+
+    function setCookie(name, value, host = 'bing.com') {
+        return new Promise(resolve => {
+            try {
+                if (typeof GM_cookie !== 'undefined' && GM_cookie) {
+                    GM_cookie('set', {
+                        url: `https://${host}/`,
+                        domain: host.endsWith('bing.com') ? '.bing.com' : host,
+                        name,
+                        value,
+                        path: '/',
+                        secure: true,
+                        sameSite: 'unspecified'
+                    }, () => resolve(true));
+                    setTimeout(() => resolve(false), 2000);
+                    return;
+                }
+            } catch (e) { /* 落到下面的降级方案 */ }
+            try {
+                if (/bing\.com$/.test(location.host)) {
+                    document.cookie = `${name}=${value}; domain=.bing.com; path=/; secure; SameSite=None`;
+                    return resolve(true);
+                }
+            } catch (e) { }
+            resolve(false);
         });
     }
 
@@ -585,6 +614,10 @@
             GM_setValue('auth_code', match[0]);
             log('✅ 授权码已保存！');
             nodes.boxAuth.style.display = 'none';
+            // 换新授权码时清掉旧 refresh_token，避免一直用失效凭据
+            GM_setValue('refresh_token', '');
+            state.accessToken = null;
+            state.accessTokenExpiresAt = 0;
         } else {
             log('❌ 格式错误，请复制完整URL');
         }
@@ -736,9 +769,9 @@
     const runSign = async () => {
         nodes.btnSign.disabled = true;
         markBusy(1);
-        await waitWhilePaused();
-        log('⏳ 签到中...');
         try {
+            await waitWhilePaused();
+            log('⏳ 签到中...');
             const res = await withAccessTokenRequest(token => gmRequest({
                 method: 'POST',
                 url: 'https://prod.rewardsplatform.microsoft.com/dapi/me/activities',
@@ -762,9 +795,12 @@
                     log('⚠️ 已签到或失败');
                 }
             }
-        } catch (e) { log('❌ 签到出错'); }
-        nodes.btnSign.disabled = false;
-        markBusy(-1);
+        } catch (e) {
+            log(`❌ 签到出错: ${e.message}`);
+        } finally {
+            nodes.btnSign.disabled = false;
+            markBusy(-1);
+        }
     };
     nodes.btnSign.onclick = runSign;
 
@@ -810,9 +846,12 @@
                     }
                 }
             }
-        } catch (e) { log('❌ 阅读出错'); }
-        nodes.btnRead.disabled = false;
-        markBusy(-1);
+        } catch (e) {
+            log(`❌ 阅读出错: ${e.message}`);
+        } finally {
+            nodes.btnRead.disabled = false;
+            markBusy(-1);
+        }
     };
     nodes.btnRead.onclick = runRead;
 
@@ -836,58 +875,162 @@
         } catch { return null; }
     }
 
-    // 新版 Earn 页面使用 Server Action；可自动化的公开活动主要是带搜索链接的活动。
-    async function runEarnSearchActivity(activityUrl) {
-        const parsed = new URL(activityUrl);
-        const host = parsed.hostname === 'cn.bing.com' ? 'cn.bing.com' : 'www.bing.com';
-        const query = parsed.searchParams.get('q');
-        if (!query) return false;
-        const searchUrl = parsed.href;
-        const ua = host === 'cn.bing.com' ? CONFIG.ua.mobile : CONFIG.ua.pc;
-        const headers = { 'User-Agent': ua, Referer: `https://${host}/?form=QBLH` };
-        const result = await gmRequest({ url: searchUrl, headers });
-        const ig = result.match(/,IG:\"([^\"]+)\"/)?.[1] || crypto.randomUUID().replace(/-/g, '').toUpperCase();
-        const reportHeaders = { ...headers, Referer: searchUrl, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
-        await gmRequest({ method: 'POST', url: `https://${host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`, headers: reportHeaders, data: 'wb=1%3bi%3d1%3bv%3d1' });
-        await gmRequest({ method: 'POST', url: `https://${host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&q=${encodeURIComponent(query)}&ajaxreq=1`, headers: reportHeaders, data: `url=${encodeURIComponent(searchUrl)}&V=web` });
-        return true;
+    async function fetchPromoTaskList() {
+        let taskList = [];
+        // 优先从 Web 主页的数据拿
+        if (dashboard && dashboard.dailySetPromotions) {
+            const today = getDateStr();
+            taskList.push(...(dashboard.dailySetPromotions[today] || []));
+            taskList.push(...(dashboard.morePromotions || []));
+        }
+
+        // Web 没拿到，尝试 App 通道
+        if (taskList.length === 0) {
+            log('ℹ️ Web 页面未获取到任务，尝试使用 App 授权通道...');
+            try {
+                const info = await withAccessTokenRequest(token => gmRequest({
+                    url: 'https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613',
+                    headers: { 'Authorization': `Bearer ${token}`, 'X-Rewards-AppId': 'SAAndroid/31.4.2110003555', 'X-Rewards-IsMobile': 'true' }
+                }));
+                if (info) {
+                    const d = JSON.parse(info);
+                    const promos = d.response?.promotions || [];
+                    taskList = promos.filter(p => !p.complete).map(p => ({
+                        offerId: p.attributes?.offerid,
+                        hash: p.attributes?.hash || null,
+                        title: p.attributes?.title || p.attributes?.offerid || '未知任务',
+                        complete: !!p.complete
+                    })).filter(p => p.offerId);
+                    log(`📱 App 通道获取到 ${taskList.length} 个待完成任务`);
+                }
+            } catch (e) {
+                log(`⚠️ App 通道获取任务失败: ${e.message}`);
+            }
+        }
+
+        // 过滤：已完成、锁定、无用的任务，并去重
+        const seen = new Set();
+        return taskList.filter(p => {
+            if (!p || p.complete) return false;
+            if (p.priority <= -2) return false;
+            if (p.exclusiveLockedFeatureStatus === 'locked') return false;
+            const key = p.offerId || p.hash;
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
     }
 
-    async function getEarnActivities() {
-        const html = await gmRequest({ url: `https://rewards.bing.com/earn?_=${Date.now()}`, headers: { Accept: 'text/html,application/xhtml+xml' }, anonymous: false });
-        const urls = new Set();
-        const re = /https:\/\/(?:www|cn)\.bing\.com\/search\?[^\"\\\s]+/gi;
-        for (const match of html.matchAll(re)) urls.add(match[0].replace(/\\u0026/g, '&'));
-        return [...urls];
+    async function reportPromoTask(p, webToken) {
+        // 方案 A：有 hash 且拿到了 Web Token，走 Web 双接口
+        if (p.hash && webToken) {
+            try {
+                await gmRequest({
+                    method: 'POST',
+                    url: 'https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    data: `id=${p.offerId}&hash=${p.hash}&activityAmount=1&__RequestVerificationToken=${webToken}`,
+                    anonymous: false
+                });
+            } catch (e) { /* 允许失败，走下一步 */ }
+
+            try {
+                await gmRequest({
+                    method: 'POST',
+                    url: 'https://www.bing.com/msrewards/api/v1/ReportActivity?ajaxreq=1',
+                    headers: { 'Content-Type': 'application/json' },
+                    data: JSON.stringify({
+                        "ActivitySubType": "quiz",
+                        "ActivityType": "notification",
+                        "OfferId": p.offerId,
+                        "Channel": "Bing.Com",
+                        "PartnerId": "BingTrivia",
+                        "Timezone": -480
+                    }),
+                    anonymous: false
+                });
+            } catch (e) { /* 允许失败 */ }
+        }
+        // 方案 B：没有 hash 或 Web Token 失败，走 App 接口
+        else {
+            await withAccessTokenRequest(t => gmRequest({
+                method: 'POST',
+                url: 'https://prod.rewardsplatform.microsoft.com/dapi/me/activities',
+                headers: {
+                    'Authorization': `Bearer ${t}`,
+                    'Content-Type': 'application/json',
+                    'X-Rewards-AppId': 'SAAndroid/31.4.2110003555',
+                    'X-Rewards-IsMobile': 'true',
+                    'X-Rewards-Country': 'cn'
+                },
+                data: JSON.stringify({
+                    amount: 1, id: uuid(), type: 101, country: 'cn',
+                    attributes: { offerid: p.offerId }
+                })
+            }));
+        }
     }
 
     const runPromo = async () => {
         nodes.btnPromo.disabled = true;
         markBusy(1);
-        await waitWhilePaused();
-        log('⏳ 开始执行活动...');
-        await updateData();
-
-        let count = 0;
-        let activities = [];
-        try { activities = await getEarnActivities(); } catch (e) { log(`❌ 读取活动失败: ${e.message}`); }
-        for (const activityUrl of activities.slice(0, 10)) {
+        try {
             await waitWhilePaused();
-            try {
-                log(`▶️ 执行搜索活动: ${new URL(activityUrl).searchParams.get('q') || '活动'}`);
-                if (await runEarnSearchActivity(activityUrl)) count++;
-                await sleep(randomRange(1500, 3000));
-            } catch (e) {
-                log(`❌ 活动执行失败: ${e.message}`);
+            log('⏳ 开始执行活动...');
+            await updateData();
+            const taskList = await fetchPromoTaskList();
+            if (taskList.length === 0) {
+                log('ℹ️ 没有需要执行的活动，或者无法获取到活动列表');
+                return;
             }
-        }
 
-        log(activities.length ? `✅ 完成搜索活动尝试，共执行 ${count} 个活动` : 'ℹ️ 当前 Earn 页面没有可自动执行的搜索活动');
-        await updateData(); // 刷新状态
-        nodes.btnPromo.disabled = false;
-        markBusy(-1);
+            const webToken = await getSearchToken();
+            let count = 0, failed = 0;
+
+            for (const p of taskList) {
+                await waitWhilePaused();
+                try {
+                    log(`▶️ 执行搜索活动: ${p.title}`);
+                    await reportPromoTask(p, webToken);
+                    await sleep(randomRange(30000, 60000));
+                    count++;
+                } catch (e) {
+                    failed++;
+                    log(`❌ 活动执行失败: ${p.title} (${e.message})`);
+                }
+            }
+
+            log(`✅ 完成搜索活动，共执行 ${count} 个活动，失败 ${failed}`);
+            await updateData();
+        } catch (e) {
+            log(`❌ 活动模块异常: ${e.message}`);
+        } finally {
+            nodes.btnPromo.disabled = false;
+            markBusy(-1);
+        }
     };
     nodes.btnPromo.onclick = runPromo;
+
+    // 解析计分响应：把「假成功」变成可判定
+    function parseCreditResponse(txt) {
+        if (!txt) return { credited: null };
+        const s = String(txt).trim();
+        if (!s.startsWith('{') && !s.startsWith('[')) return { credited: null };
+        try {
+            const d = JSON.parse(s);
+            const candidates = [
+                d.numPoints, d.points, d.rewardPoints, d.numpoints,
+                d?.response?.numPoints, d?.response?.points
+            ];
+            const num = candidates.find(v => typeof v === 'number');
+            if (typeof num === 'number') return { credited: num > 0, points: num };
+            if (d.success === true || d.credited === true) return { credited: true };
+            if (d.success === false || d.credited === false) return { credited: false };
+            return { credited: null };
+        } catch {
+            return { credited: null };
+        }
+    }
 
     const runSearch = async () => {
         if (state.running) {
@@ -909,22 +1052,22 @@
             await waitWhilePaused();
             const host = isMobile ? 'cn.bing.com' : 'www.bing.com';
             const ua = isMobile ? CONFIG.ua.mobile : CONFIG.ua.pc;
-            const deviceCookie = isMobile ? `_Rwho=u=m&ts=${getDateHyphen()}` : `_Rwho=u=d&ts=${getDateHyphen()}`;
             const searchUrl = `https://${host}/search?q=${encodeURIComponent(query)}&form=QBLH`;
 
             await deleteCookie('_EDGE_S', host);
             await deleteCookie('_Rwho', host);
             await deleteCookie('_RwBf', host);
-
+            // 👈 用 cookie jar 写入端标识，而不是手写请求头
+            await setCookie('_Rwho', isMobile ? `u=m&ts=${getDateHyphen()}` : `u=d&ts=${getDateHyphen()}`, host);
             try {
                 // 执行搜索
                 const searchResult = await gmRequest({
                     url: searchUrl,
                     headers: {
                         'User-Agent': ua,
-                        'Cookie': deviceCookie,
                         'Referer': `https://${host}/?form=QBLH`
-                    }
+                    },
+                    anonymous: false
                 });
 
                 // 尝试提取 IG 参数用于报告
@@ -934,7 +1077,6 @@
                 // 报告搜索活动 (关键！这是计分的核心)
                 const reportHeaders = {
                     'User-Agent': ua,
-                    'Cookie': deviceCookie,
                     'Referer': searchUrl,
                     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
                 };
@@ -945,23 +1087,29 @@
                         method: 'POST',
                         url: `https://${host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
                         headers: reportHeaders,
-                        data: 'wb=1%3bi%3d1%3bv%3d1'
+                        data: 'wb=1%3bi%3d1%3bv%3d1',
+                        anonymous: false
                     });
                 } catch (e) {
                     log(`⚠️ ncheader 失败: ${e.message}`);
                 }
 
                 // reportActivity 请求
-                await gmRequest({
+                const rep = await gmRequest({
                     method: 'POST',
                     url: `https://${host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&q=${encodeURIComponent(query)}&ajaxreq=1`,
                     headers: reportHeaders,
-                    data: `url=${encodeURIComponent(searchUrl)}&V=web`
+                    data: `url=${encodeURIComponent(searchUrl)}&V=web`,
+                    anonymous: false
                 });
 
-                log(`✓ ${isMobile ? '📱' : '💻'} "${query.substring(0, 15)}..."`);
+                const credit = parseCreditResponse(rep);
+                const status = credit.credited === true ? (credit.points ? ` +${credit.points}` : '') : credit.credited === false ? ' 未计分' : ' (未确认)';
+                log(`✓ ${isMobile ? '📱' : '💻'} "${query.substring(0, 15)}..."${status}`);
+                return credit;
             } catch (e) {
                 log(`✗ 搜索失败: ${e.message}`);
+                return { credited: false, error: e.message };
             }
         };
 
