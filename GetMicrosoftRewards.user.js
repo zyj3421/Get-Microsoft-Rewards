@@ -351,6 +351,33 @@
             border-radius: 8px 8px 0 0;
         }
         #mr-title { font-weight: 600; font-size: 14px; color: #333; }
+        .mr-header-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .mr-icon-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            font-size: 14px;
+            line-height: 1;
+            color: #666;
+            transition: transform 0.2s;
+        }
+        .mr-icon-btn:hover {
+            color: #333;
+            transform: scale(1.1);
+        }
+        .mr-icon-btn:active {
+            transform: scale(0.95);
+        }
+        .mr-icon-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
         #mr-close { cursor: pointer; color: #999; font-size: 18px; line-height: 1; }
         #mr-close:hover { color: #333; }
 
@@ -407,7 +434,10 @@
         <div id="mr-container">
             <div id="mr-header">
                 <div id="mr-title"><span>🎁</span> Microsoft Rewards</div>
-                <div id="mr-close">×</div>
+                <div class="mr-header-actions">
+                    <button id="btn-refresh" class="mr-icon-btn" title="刷新数据">🔄</button>
+                    <div id="mr-close">×</div>
+                </div>
             </div>
 
             <div id="mr-body">
@@ -460,6 +490,7 @@
         read: $('#mr-read'),
         readBar: $('#mr-read-bar'),
         btnSearch: $('#btn-search'),
+        btnRefresh: $('#btn-refresh'),
         btnPromo: $('#btn-promo'),
         valPromo: $('#val-promo'),
         btnSign: $('#btn-sign'),
@@ -570,6 +601,11 @@
         return code;
     }
 
+    // 根据等级返回会员名称
+    const getLevelName = (level) => {
+        return level >= 3 ? '🥇 金牌会员' : level === 2 ? '🥈 银牌会员' : '🥉 会员';
+    };
+
     // ========== 核心逻辑 (简化版引用) ==========
 
     // Rewards 网站已迁移到 Next.js Dashboard，旧的 /api/getuserinfo 会返回 401。
@@ -628,7 +664,7 @@
                 state.promosDone = data.promosDone;
 
                 render();
-                log(`✓ 数据已更新: Lv.${state.level} ${state.points}pts`);
+                log(`✓ 数据已更新: ${getLevelName(state.level)} ${state.points}pts`);
             } catch (e) {
                 console.error('updateData error:', e);
                 log(`⚠️ 获取数据出错: ${e.message}`);
@@ -641,7 +677,7 @@
     }
 
     function render() {
-        nodes.level.textContent = state.level >= 3 ? '🥇金牌会员' : state.level === 2 ? '🥈银牌会员' : '🥉会员';
+        nodes.level.textContent = getLevelName(state.level);
         nodes.points.textContent = state.points.toLocaleString();
 
         nodes.pc.textContent = `${state.pcCur}/${state.pcMax}`;
@@ -779,6 +815,14 @@
         markBusy(-1);
     };
     nodes.btnRead.onclick = runRead;
+
+    nodes.btnRefresh.onclick = async (e) => {
+        e.stopPropagation();
+        nodes.btnRefresh.disabled = true;
+        log('🔄 手动刷新数据...');
+        await updateData();
+        nodes.btnRefresh.disabled = false;
+    };
 
     // 搜索 (复用逻辑)
     // 获取 Reward Token (活动专用)
@@ -1058,6 +1102,14 @@
         log('🌟 脚本就绪 v1.0.1.2');
     })();
 
-    setInterval(updateData, 60000);
+    (function scheduleNextUpdate() {
+        const minutes = randomRange(30, 90);
+        const delay = minutes * 60 * 1000;
+        log(`⏱️ 下次自动刷新：${minutes} 分钟后`);
+        setTimeout(async () => {
+            await updateData();
+            scheduleNextUpdate();
+        }, delay);
+    })();
 
 })();
